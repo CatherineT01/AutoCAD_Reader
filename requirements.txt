@@ -1,0 +1,7 @@
+pdfplumber 
+pytesseract 
+pdf2image 
+opencv-python 
+pillow 
+colorama 
+numpy
