@@ -1,2 +1,9 @@
 GitPortable/ 
-GitPortable/ 
+__pycache__/ 
+*.pyc 
+*.pyo 
+*.pyd 
+*.log 
+*.tmp 
+*.bak 
+*.env 
