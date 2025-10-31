@@ -1,7 +1,5 @@
-# drawingSystem.py
 import os
 from PDF_Analyzer import find_pdf, process_pdf, print_typed, ask_question_about_description
-from colorama import init, Fore, Style
 from semanticMemory import build_index, search_similar_files
 from utils import load_cache, save_cache, get_file_hash, CACHE_FILE
 
@@ -33,10 +31,6 @@ class AutoCADFinder:
                     print(Fore.YELLOW + "Please enter a search term." + Style.RESET_ALL)
             elif user_input in {"4", "clear"}:
                 self.clear_cache()
-            elif user_input.lower().endswith(".pdf"):
-                result = self.process_pdf_file(user_input)
-                if result == "EXIT":  # User quit during Q&A
-                    break
             elif user_input.lower() == "build index":
                 print("Building vector index...")
                 build_index()
@@ -113,4 +107,3 @@ class AutoCADFinder:
 if __name__ == "__main__":
     system = AutoCADFinder()
     system.run()
-    #tester hehe

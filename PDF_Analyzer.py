@@ -1,22 +1,15 @@
 # PDF_Analyzer.py
 import os
 import re
-import time
 import json
 import base64
 import numpy as np
 from io import BytesIO
-
 import pdfplumber
 import pytesseract
-import platform
-import shutil
 from pdf2image import convert_from_path
 from PIL import Image, ImageEnhance, ImageFilter
-
-import cv2  
 from colorama import init, Fore, Style
-
 from utils import client, grok_client
 # --------------------------------------------------------------
 #  AUTO-DETECT TESSERACT & POPPLER
@@ -162,8 +155,6 @@ def ocr_full_document(pdf_path, max_pages=5, debug_ocr=False):
         # early exit if we already have a strong hit
         if best_score > 20:
             break
-
-    # DEBUG
     if debug_ocr:
         with open("DEBUG_OCR.txt", "w", encoding="utf-8") as f:
             f.write(best_text)
@@ -171,43 +162,9 @@ def ocr_full_document(pdf_path, max_pages=5, debug_ocr=False):
     return best_text
 
 # --------------------------------------------------------------
-#  4. TEXT EXTRACTION (vector first → OCR fallback)
-# --------------------------------------------------------------
-def extract_text(pdf_path, debug_ocr=False):
-    # ---------- 1. Try vector text (pdfplumber) ----------
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            text_parts = []
-            for page in pdf.pages[:3]:               # title block usually on first 3 pages
-                page_text = page.extract_text(
-                    x_tolerance=3,
-                    y_tolerance=3,
-                    use_text_flow=True,
-                    keep_blank_chars=True
-                )
-                if page_text:
-                    text_parts.append(page_text)
-            full_text = "\n".join(text_parts)
-            if full_text.strip() and len(full_text) > 50:
-                if debug_ocr:
-                 return full_text
-    except Exception as e:
-        print(Fore.YELLOW + f"[Vector extraction failed: {e}]" + Style.RESET_ALL)
-
-    # ---------- 2. OCR fallback (FULL DOCUMENT, up to 5 pages) ----------
-    try:
-        ocr_text = ocr_full_document(pdf_path, max_pages=5, debug_ocr=debug_ocr)
-        return ocr_text
-    except Exception as e:
-        print(Fore.RED + f"[OCR failed: {e}]" + Style.RESET_ALL)
-        return ""
-# --------------------------------------------------------------
 #  5. SPECS EXTRACTION USING GROK (JSON OUTPUT)
 # --------------------------------------------------------------
 def extract_specs_with_grok(text):
-    """
-    Sends OCR text to Grok and asks for structured JSON specs.
-    """
     prompt = f"""
 You are a hydraulic cylinder expert. Extract ONLY these specs from the drawing text below.
 Return ONLY valid JSON (no extra text):
@@ -226,12 +183,10 @@ Return ONLY valid JSON (no extra text):
     "Transducer": "Yes or No",
     "Title": "H-ME5-2.00 X 1.375 X 4.00"
 }}
-If a value is missing, use "?".
 
 Drawing text:
 {text[:4000]}
 """
-
     try:
         resp = grok_client.chat.completions.create(
             model="grok-3",
@@ -256,14 +211,6 @@ Drawing text:
             elif specs.get(k, "?").lower() in ["no", "n", "false", ""]:
                 specs[k] = "??"
 
-        return specs
-
-    except Exception as e:
-        print(Fore.RED + f"[Grok spec extraction failed: {e}]" + Style.RESET_ALL)
-        return {k: "??" for k in [
-            "Bore", "Rod", "Stroke", "Part", "Rev", "Date",
-            "Mounting", "Port", "Pressure", "Spring Probe", "Transducer", "Title"
-        ]}
 
 # --------------------------------------------------------------
 #  6. CLEAN DESCRIPTION (Grok)
@@ -303,14 +250,12 @@ def ask_follow_up(description, specs, on_exit_callback=None):
     print(Fore.CYAN + "\nAsk questions about this drawing (or press Enter to continue):" + Style.RESET_ALL)
     while True:
         q = input(Fore.YELLOW + "→ " + Style.RESET_ALL).strip()
-        # Empty input = return to main menu
         if not q:
             print(Fore.GREEN + "Returning to main menu..." + Style.RESET_ALL)
             if on_exit_callback:
                 on_exit_callback(skip_plain=True)
             break
             
-        # Exit commands
         if q.lower() in {"exit", "quit", "bye", "goodbye"}:
             print(Fore.GREEN + "Goodbye! Have a great day!" + Style.RESET_ALL)
             if on_exit_callback:
@@ -352,7 +297,6 @@ def find_pdf(filename=None, list_all=False, root=None):
         for dp, _, fs in os.walk(root)
         for f in fs if f.lower().endswith(".pdf")
     ]
-
     if list_all:
         print(Fore.CYAN + f"Scanning {len(all_pdfs)} PDFs..." + Style.RESET_ALL)
         matches = []
@@ -367,18 +311,6 @@ def find_pdf(filename=None, list_all=False, root=None):
                 print(f"  → {Fore.YELLOW}{reason}{Style.RESET_ALL}")
         print(f"\n{Fore.GREEN}Done – {len(matches)} AutoCAD drawings found.{Style.RESET_ALL}")
         return matches
-
-    else:
-        name_lower = filename.lower()
-        for p in all_pdfs:
-            if os.path.basename(p).lower() == name_lower:
-                if is_autocad_drawing(p):
-                    return p
-                else:
-                    print(Fore.RED + f"'{filename}' is not an AutoCAD drawing." + Style.RESET_ALL)
-                    return None
-        print(Fore.RED + f"File not found: {filename}" + Style.RESET_ALL)
-        return None
 
 # --------------------------------------------------------------
 #  9. PROCESS PDF 
@@ -406,8 +338,6 @@ def process_pdf(pdf_path, skip_plain_english=False):
             found_specs = True
     if not found_specs:
         print("No specifications found in drawing.")
-    else:
-        print(f"({len([v for v in specs.values() if v not in ['??', '?', '', 'No']])} specs extracted)")
     print("─" * 50)
 
     # ----- description -----
@@ -421,11 +351,9 @@ def process_pdf(pdf_path, skip_plain_english=False):
 
     result = ask_follow_up(description, specs, on_exit_callback=on_exit)
     
-    # If user wants to exit program entirely
     if result == "EXIT_PROGRAM":
         return None  # Signal to drawingSystem.py to quit
 
-    # ----- Plain English (unless skipped) -----
     if not skip_plain_english:
         print("\n" + "="*70)
         print("Plain English Explanation:")
@@ -433,7 +361,6 @@ def process_pdf(pdf_path, skip_plain_english=False):
         print("="*70 + "\n")
 
     return description
-
 # --------------------------------------------------------------
 #  10. Q&A ABOUT LAST DESCRIPTION
 # --------------------------------------------------------------
