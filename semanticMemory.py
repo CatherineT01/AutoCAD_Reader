@@ -20,8 +20,9 @@ def get_text_embedding(text: str):
         print(f"[Embedding error] {e}")
         return None
 
+
 # ----------------------------------------------------------------------
-# 2. OPTIONAL: Vision embedding (gpt-4o) 
+# 2. OPTIONAL: Vision embedding (gpt-4o) – a *second* vector for the image
 # ----------------------------------------------------------------------
 def get_image_embedding(pdf_path: str):
     """
@@ -59,13 +60,14 @@ def get_image_embedding(pdf_path: str):
         print(f"[Vision embedding error] {e}")
         return None
 
+
 # ----------------------------------------------------------------------
 # 3. Build the FAISS-style JSON index
 # ----------------------------------------------------------------------
 def build_index():
     cache = load_cache()
-    embeddings = []          
-    metadata   = []          
+    embeddings = []          # list of np.float32 vectors
+    metadata   = []          # list of (hash, path)
 
     for file_hash, entry in cache.items():
         # --------------------------------------------------------------
@@ -113,6 +115,7 @@ def build_index():
 
     print(f"Index built – {len(embeddings)} text vectors (vision vectors stored in cache)")
 
+
 # ----------------------------------------------------------------------
 # 4. Search – text query against text embeddings
 # ----------------------------------------------------------------------
@@ -137,8 +140,9 @@ def search_similar_files(query: str, top_k: int = 3):
 
     return [metadata[i] for i in top_idx]
 
+
 # ----------------------------------------------------------------------
-# 5. Vision-only search 
+# 5. OPTIONAL: Vision-only search (if you want to query with an image)
 # ----------------------------------------------------------------------
 def search_by_image(pdf_path: str, top_k: int = 3):
     """Search using the *vision* embedding of the supplied PDF."""

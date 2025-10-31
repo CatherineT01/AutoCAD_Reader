@@ -46,7 +46,12 @@ class AutoCADFinder:
 
     def list_pdfs(self):
         print("Scanning current folder + ALL subfolders...")
-        self.file_cache = find_pdf(list_all=True)
+        folder = input("Enter directory to scan for AutoCAD PDFs: ").strip()
+        if not os.path.exists(folder):
+            print(Fore.RED + "Folder not found. Scanning current folder instead." + Style.RESET_ALL)
+            folder = os.getcwd()
+        self.file_cache = find_pdf(list_all=True, root=folder)
+
         if self.file_cache:
             print(f"\nFound {len(self.file_cache)} AutoCAD-style PDFs:")
             for i, f in enumerate(self.file_cache, 1):
@@ -105,12 +110,7 @@ class AutoCADFinder:
         print(answer)
         print("="*70 + "\n")
 
-
 if __name__ == "__main__":
-    if not os.getenv("OPENAI_API_KEY") or not os.getenv("GROK_API_KEY"):
-        print(Fore.RED + "Missing API keys! Please set OPENAI_API_KEY and GROK_API_KEY as environment variables." + Style.RESET_ALL)
-        print("Example (Windows): setx OPENAI_API_KEY your-key")
-        exit(1)
-
     system = AutoCADFinder()
     system.run()
+    #tester hehe

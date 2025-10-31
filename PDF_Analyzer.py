@@ -1,3 +1,4 @@
+# PDF_Analyzer.py
 import os
 import re
 import time
@@ -18,24 +19,22 @@ from colorama import init, Fore, Style
 
 from utils import client, grok_client
 # --------------------------------------------------------------
-#  AUTO-DETECT TESSERACT & POPPLER (PORTABLE)
+#  AUTO-DETECT TESSERACT & POPPLER
 # --------------------------------------------------------------
 def _find_tesseract():
     exe = "tesseract.exe" if platform.system() == "Windows" else "tesseract"
     path = shutil.which(exe)
     if path:
         return path
-    local = os.path.join(os.path.dirname(__file__), "tesseract", exe)
-    if os.path.exists(local):
-        return local
-    raise FileNotFoundError("Tesseract not found. Place tesseract.exe in /tesseract/")
+    #Fallback: assume in project folder
+    return os.path.join(os.path.dirname(__file__), "tesseract", exe)
 
 def _find_poppler():
-    local = os.path.join(os.path.dirname(__file__), "poppler", "bin")
-    if os.path.exists(local):
-        return local
-    raise FileNotFoundError("Poppler not found. Place bin/ in /poppler/")
-
+    #try system, them project folder
+    base = os.path.join(os.path.dirname(__file__), "poppler", bin)
+    if os.path.exists(base):
+        return base
+    return None
 pytesseract.pytesseract.tesseract_cmd = _find_tesseract()
 POPPLER_PATH = _find_poppler()
 
@@ -78,13 +77,20 @@ def is_autocad_drawing(path):
         return False
     except Exception:
         return False
-
 # --------------------------------------------------------------
 #  FULL-PAGE OCR – works on any layout, no title-block assumption
 # --------------------------------------------------------------
 def _preprocess_full_page(pil_image):
+    """
+    Returns a clean, high-contrast PIL image ready for Tesseract.
+    """
+    # 1. Grayscale
     img = pil_image.convert('L')
+
+    # 2. Strong contrast
     img = ImageEnhance.Contrast(img).enhance(5.0)
+
+    # 3. Adaptive threshold – kills hatching / shading
     img_np = np.array(img)
     binary = cv2.adaptiveThreshold(
         img_np, 255,
@@ -100,9 +106,15 @@ def _preprocess_full_page(pil_image):
     binary = cv2.resize(binary, (w*2, h*2), interpolation=cv2.INTER_LANCZOS4)
 
     processed = Image.fromarray(binary)
+
+    processed.save("DEBUG_FULL_PAGE.png")
     return processed
 
-def ocr_full_document(pdf_path, max_pages=5):
+def ocr_full_document(pdf_path, max_pages=5, debug_ocr=False):
+    """
+    OCR the first *max_pages* of the PDF.
+    Returns the best-looking text (most spec keywords + numbers).
+    """
     pages = convert_from_path(
         pdf_path,
         first_page=1,
@@ -114,11 +126,12 @@ def ocr_full_document(pdf_path, max_pages=5):
     best_text = ""
     best_score = -1
 
+    # PSM modes that work well on technical drawings
     psm_configs = [
-        '--psm 6',
-        '--psm 11',
-        '--psm 3',
-        '--psm 4',
+        '--psm 6',   # single uniform block
+        '--psm 11',  # sparse text
+        '--psm 3',   # fully automatic
+        '--psm 4',   # single column of variable sizes
     ]
 
     whitelist = ('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -133,6 +146,7 @@ def ocr_full_document(pdf_path, max_pages=5):
                     processed,
                     config=f'{cfg} -c tessedit_char_whitelist={whitelist}'
                 )
+                # Score: count spec keywords + numeric tokens
                 score = (
                     len(re.findall(r'\bBORE\b', txt, re.I)) * 5 +
                     len(re.findall(r'\bROD\b', txt, re.I)) * 5 +
@@ -145,19 +159,26 @@ def ocr_full_document(pdf_path, max_pages=5):
             except Exception:
                 continue
 
+        # early exit if we already have a strong hit
         if best_score > 20:
             break
+
+    # DEBUG
+    if debug_ocr:
+        with open("DEBUG_OCR.txt", "w", encoding="utf-8") as f:
+            f.write(best_text)
 
     return best_text
 
 # --------------------------------------------------------------
 #  4. TEXT EXTRACTION (vector first → OCR fallback)
 # --------------------------------------------------------------
-def extract_text(pdf_path):
+def extract_text(pdf_path, debug_ocr=False):
+    # ---------- 1. Try vector text (pdfplumber) ----------
     try:
         with pdfplumber.open(pdf_path) as pdf:
             text_parts = []
-            for page in pdf.pages[:3]:
+            for page in pdf.pages[:3]:               # title block usually on first 3 pages
                 page_text = page.extract_text(
                     x_tolerance=3,
                     y_tolerance=3,
@@ -168,21 +189,25 @@ def extract_text(pdf_path):
                     text_parts.append(page_text)
             full_text = "\n".join(text_parts)
             if full_text.strip() and len(full_text) > 50:
-                return full_text
+                if debug_ocr:
+                 return full_text
     except Exception as e:
         print(Fore.YELLOW + f"[Vector extraction failed: {e}]" + Style.RESET_ALL)
 
+    # ---------- 2. OCR fallback (FULL DOCUMENT, up to 5 pages) ----------
     try:
-        ocr_text = ocr_full_document(pdf_path, max_pages=5)
+        ocr_text = ocr_full_document(pdf_path, max_pages=5, debug_ocr=debug_ocr)
         return ocr_text
     except Exception as e:
         print(Fore.RED + f"[OCR failed: {e}]" + Style.RESET_ALL)
         return ""
-
 # --------------------------------------------------------------
 #  5. SPECS EXTRACTION USING GROK (JSON OUTPUT)
 # --------------------------------------------------------------
 def extract_specs_with_grok(text):
+    """
+    Sends OCR text to Grok and asks for structured JSON specs.
+    """
     prompt = f"""
 You are a hydraulic cylinder expert. Extract ONLY these specs from the drawing text below.
 Return ONLY valid JSON (no extra text):
@@ -211,11 +236,12 @@ Drawing text:
         resp = grok_client.chat.completions.create(
             model="grok-3",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
+            temperature=0.0,  # deterministic
             max_tokens=300
         )
         raw = resp.choices[0].message.content.strip()
 
+        # Clean: remove markdown if present
         if "```json" in raw:
             raw = raw.split("```json")[1].split("```")[0]
         elif "```" in raw:
@@ -223,6 +249,7 @@ Drawing text:
 
         specs = json.loads(raw)
 
+        # Convert "Yes"/"No" → "Yes"
         for k in ["Spring Probe", "Transducer"]:
             if specs.get(k, "?").lower() in ["yes", "y", "true"]:
                 specs[k] = "Yes"
@@ -276,22 +303,26 @@ def ask_follow_up(description, specs, on_exit_callback=None):
     print(Fore.CYAN + "\nAsk questions about this drawing (or press Enter to continue):" + Style.RESET_ALL)
     while True:
         q = input(Fore.YELLOW + "→ " + Style.RESET_ALL).strip()
+        # Empty input = return to main menu
         if not q:
             print(Fore.GREEN + "Returning to main menu..." + Style.RESET_ALL)
             if on_exit_callback:
                 on_exit_callback(skip_plain=True)
             break
             
+        # Exit commands
         if q.lower() in {"exit", "quit", "bye", "goodbye"}:
             print(Fore.GREEN + "Goodbye! Have a great day!" + Style.RESET_ALL)
             if on_exit_callback:
                 on_exit_callback(skip_plain=True)
-            return "EXIT_PROGRAM"
+            return "EXIT_PROGRAM"  # Signal to drawingSystem.py to quit
+            break
             
         if q.lower() in {"thank you", "thanks", "ty", "thankyou"}:
             print(Fore.GREEN + "You're very welcome! Press Enter to continue..." + Style.RESET_ALL)
             continue
 
+        # Process question
         prompt = f"""
 Drawing:
 {description}
@@ -314,8 +345,8 @@ Answer in 1-3 short sentences:
 # --------------------------------------------------------------
 #  8. FIND PDFs
 # --------------------------------------------------------------
-def find_pdf(filename=None, list_all=False):
-    root = os.getcwd()
+def find_pdf(filename=None, list_all=False, root=None):
+    root = root or os.getcwd()  # fallback to current directory if not provided
     all_pdfs = [
         os.path.join(dp, f)
         for dp, _, fs in os.walk(root)
@@ -350,21 +381,27 @@ def find_pdf(filename=None, list_all=False):
         return None
 
 # --------------------------------------------------------------
-#  9. PROCESS PDF
+#  9. PROCESS PDF 
 # --------------------------------------------------------------
 def process_pdf(pdf_path, skip_plain_english=False):
     name = os.path.basename(pdf_path)
     print(Fore.CYAN + f"\nProcessing: {name}" + Style.RESET_ALL)
 
-    text = extract_text(pdf_path)
+    # ----- extract raw text (debug OCR optional) -----
+    text = extract_text(pdf_path, debug_ocr=True)
+
+    # ----- extract specs using Grok -----
     specs = extract_specs_with_grok(text)
+
+    # ----- description -----
     description = generate_description(text, specs)
 
+    # ----- specs table -----
     print(Fore.MAGENTA + "\nSPECIFICATIONS" + Style.RESET_ALL)
     print("─" * 50)
     found_specs = False
     for k, v in specs.items():
-        if v not in ["??", "?", "", "No"]:
+        if v not in ["??", "?", "", "No"]:  # Hide missing values
             print(f"{k:<12}: {v}")
             found_specs = True
     if not found_specs:
@@ -373,17 +410,22 @@ def process_pdf(pdf_path, skip_plain_english=False):
         print(f"({len([v for v in specs.values() if v not in ['??', '?', '', 'No']])} specs extracted)")
     print("─" * 50)
 
+    # ----- description -----
     print(Fore.CYAN + "\nDESCRIPTION" + Style.RESET_ALL)
     print(description)
 
+    # ----- Q&A -----
     def on_exit(skip_plain):
         nonlocal skip_plain_english
         skip_plain_english = skip_plain
 
     result = ask_follow_up(description, specs, on_exit_callback=on_exit)
+    
+    # If user wants to exit program entirely
     if result == "EXIT_PROGRAM":
-        return None
+        return None  # Signal to drawingSystem.py to quit
 
+    # ----- Plain English (unless skipped) -----
     if not skip_plain_english:
         print("\n" + "="*70)
         print("Plain English Explanation:")

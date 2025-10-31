@@ -8,7 +8,7 @@ from openai import OpenAI
 # Read API keys from system environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
-
+ 
 # Initialize OpenAI client
 client = OpenAI(
     api_key=OPENAI_API_KEY,
