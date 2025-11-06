@@ -35,19 +35,18 @@ def list_database_files():
         ids = results.get("ids", [])
         docs = results.get("documents", [])
         metas = results.get("metadatas", [])
-
+        
         if not ids:
             print(Fore.YELLOW + "No files in database." + Style.RESET_ALL)
             return []
-
+        
         # Print only the file list
         print(Fore.CYAN + "\nFiles currently in database:" + Style.RESET_ALL)
         for i, fid in enumerate(ids, 1):
             print(f"{i}) {fid}")
-
+        
         # Return structured data for interactive_qa()
         return list(zip(ids, docs, [m.get("specs", "{}") for m in metas]))
-
     except Exception as e:
         print(Fore.RED + f"Error listing database files: {e}" + Style.RESET_ALL)
         return []
@@ -66,9 +65,11 @@ def search_similar_files(query):
         results = collection.query(query_texts=[query], n_results=5)
         matches = results.get("ids", [[]])[0]
         docs = results.get("documents", [[]])[0]
+        
         if not matches:
             print(Fore.YELLOW + "No similar files found." + Style.RESET_ALL)
             return
+        
         print(Fore.CYAN + f"\nTop matches for '{query}':" + Style.RESET_ALL)
         for i, (fid, desc) in enumerate(zip(matches, docs), 1):
             print(f"{i}) {fid} — {desc[:100]}...")

@@ -1,11 +1,19 @@
 # utils.py
+from dotenv import load_dotenv
 import os
 import json
 import hashlib
+import httpx
 from openai import OpenAI
+from colorama import init, Fore, Style
+import subprocess
+
+init(autoreset=True)
+load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
+CACHE_FILE = os.path.join(os.path.dirname(__file__), "description_cache.json")
 
 # Initialize OpenAI client
 if not OPENAI_API_KEY:
@@ -17,6 +25,38 @@ else:
     except Exception as e:
         print(Fore.RED + f"Failed to initialize OpenAI client: {e}" + Style.RESET_ALL)
         openai_client = None
+
+# Grok client wrapper
+class GrokClient:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.endpoint = "https://api.x.ai/v1/chat/completions"
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+    def chat(self, messages, model="grok-3-beta"):
+        payload = {
+            "model": model,
+            "messages": messages
+        }
+        try:
+            response = httpx.post(self.endpoint, headers=self.headers, json=payload, timeout=30.0)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            print(Fore.RED + f"Grok API error: {e.response.status_code} - {e.response.text}" + Style.RESET_ALL)
+        except Exception as e:
+            print(Fore.RED + f"Grok request failed: {e}" + Style.RESET_ALL)
+        return None
+
+# Initialize Grok client
+if not GROK_API_KEY:
+    print(Fore.YELLOW + "GROK_API_KEY not set. Get it from https://console.grok.com." + Style.RESET_ALL)
+    grok_client = None
+else:
+    grok_client = GrokClient(GROK_API_KEY)
 
 BASE_DIR = os.path.dirname(__file__)
 INDEX_FILE = os.path.join(BASE_DIR, "vector_index.json")

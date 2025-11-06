@@ -3,6 +3,13 @@ import json
 import fitz 
 import pdfplumber
 from pdf2image import convert_from_path
+import pytesseract
+from PIL import Image
+import numpy as np
+import cv2
+from colorama import init, Fore, Style
+init(autoreset=True)
+
 from utils import openai_client, grok_client, load_cache, save_cache, get_file_hash, CACHE_FILE, is_valid_specs,is_poppler_available,chat_with_ai
 
 # --- Paths ---

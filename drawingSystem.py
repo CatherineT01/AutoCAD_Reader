@@ -6,6 +6,7 @@ from semanticMemory import add_to_database, list_database_files, remove_from_dat
 from utils import load_cache, save_cache, get_file_hash, CACHE_FILE, is_valid_specs
 
 init(autoreset=True)
+LAST_DIR_FILE = "last_dir.txt"
 
 def load_last_directory():
     try:
@@ -51,10 +52,15 @@ def process_pdf_file(file_path, silent=False, show_progress=False, current=0, to
     specs = extract_specs_from_text(text)
     
     if not is_valid_specs(specs):
-        if not silent and not show_progress:
+        # Always show skip messages during batch processing for debugging
+        if show_progress:
+            print(Fore.YELLOW + f"\n  → Skipped: No valid specs found in {os.path.basename(file_path)}" + Style.RESET_ALL)
+        elif not silent:
             print(Fore.YELLOW + f"Skipped: No valid specs found in {os.path.basename(file_path)}" + Style.RESET_ALL)
         return False
-    desc = generate_description(text,specs)
+    
+    # Generate description
+    desc = generate_description(text, specs)
     if not desc:
         desc = "AutoCAD drawing (no description generated)"
 
@@ -88,6 +94,9 @@ def interactive_qa():
         if not (0 <= idx < len(rows)):
             print(Fore.RED + "Invalid selection." + Style.RESET_ALL)
             return
+        
+        fname, desc, specs_json = rows[idx]
+        specs = json.loads(specs_json)
         cache = load_cache()
         last_dir = load_last_directory() or "C:\\"
         file_hash = get_file_hash(os.path.join(last_dir, fname))
@@ -193,17 +202,28 @@ def main():
             if confirm == "y":
                 print(Fore.CYAN + f"\nProcessing {len(pdf_list)} files..." + Style.RESET_ALL)
                 added = 0
+                skipped = 0
+                
                 for idx, f in enumerate(pdf_list, 1):
                     if process_pdf_file(f, silent=True, show_progress=True, current=idx, total=len(pdf_list)):
                         added += 1
+                    else:
+                        skipped += 1
                 
                 # Clear progress line and show final result
-                print(Fore.GREEN + f"\r[{len(pdf_list)}/{len(pdf_list)}] Complete! Added {added} PDFs to database." + Style.RESET_ALL + " " * 20)
+                print(Fore.GREEN + f"\r[{len(pdf_list)}/{len(pdf_list)}] Complete!" + Style.RESET_ALL + " " * 50)
+                print(Fore.CYAN + f"Summary: {added} added, {skipped} skipped" + Style.RESET_ALL)
+                
+                if skipped > 0:
+                    print(Fore.YELLOW + f"Tip: Run option 6 on individual files to see why they were skipped." + Style.RESET_ALL)
+        
         elif choice == "8":
             interactive_qa()
+        
         elif choice == "9":
             print("Goodbye!")
             break
+        
         else:
             print(Fore.RED + "Invalid selection (1-9)." + Style.RESET_ALL)
 
