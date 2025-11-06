@@ -1,9 +1,29 @@
-GitPortable/ 
-__pycache__/ 
-*.pyc 
-*.pyo 
-*.pyd 
-*.log 
-*.tmp 
-*.bak 
-*.env 
+# GitPortable
+GitPortable/
+
+# Python cache / compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs / temporary files
+*.log
+*.tmp
+*.bak
+*.env
+
+# Visual Studio files
+.vs/
+bin/
+obj/
+*.user
+*.suo
+
+# Databases / logs
+*.db
+*.json
+*.txt
+
+# Other temporary folders
+DWG_to_PDF/
