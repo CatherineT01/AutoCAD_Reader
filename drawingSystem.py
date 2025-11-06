@@ -1,109 +1,211 @@
 import os
-from PDF_Analyzer import find_pdf, process_pdf, print_typed, ask_question_about_description
-from semanticMemory import build_index, search_similar_files
-from utils import load_cache, save_cache, get_file_hash, CACHE_FILE
+import json
+from colorama import init, Fore, Style
+from PDF_Analyzer import find_pdf, is_autocad_pdf, answer_question, extract_text, ocr_full_document, extract_specs_from_text, generate_description
+from semanticMemory import add_to_database, list_database_files, remove_from_database, search_similar_files
+from utils import load_cache, save_cache, get_file_hash, CACHE_FILE, is_valid_specs
 
-# Initialize colorama
 init(autoreset=True)
 
-class AutoCADFinder:
-    def __init__(self):
-        self.file_cache = []
-        self.last_description = ""
+def load_last_directory():
+    try:
+        with open(LAST_DIR_FILE, "r") as f:
+            return f.read().strip()
+    except:
+        return None
 
-    def run(self):
-        print_typed("AutoCAD PDF Finder & Explainer", delay=0.02)
-        print("Options: [1] List PDFs, [2] Exit, [3] Search Similar, [4] Clear Cache, or enter a PDF filename.")
-        print("=" * 70)
+def save_last_directory(directory):
+    try:
+        with open(LAST_DIR_FILE, "w") as f:
+            f.write(directory)
+    except:
+        pass
 
-        while True:
-            user_input = input(">>> ").strip()
-            if user_input in {"2", "exit", "quit"}:
-                print_typed("Goodbye!", delay=0.02)
-                break
-            elif user_input in {"1", "list"}:
-                self.list_pdfs()
-            elif user_input in {"3", "search"}:
-                query = input("Search query: ").strip()
-                if query:
-                    self.search_drawings(query)
-                else:
-                    print(Fore.YELLOW + "Please enter a search term." + Style.RESET_ALL)
-            elif user_input in {"4", "clear"}:
-                self.clear_cache()
-            elif user_input.lower() == "build index":
-                print("Building vector index...")
-                build_index()
-                print(Fore.GREEN + "Index built successfully!" + Style.RESET_ALL)
-            else:
-                self.ask_about_last(user_input)
+def prompt_directory(default_dir):
+    dir_input = input(f"Enter directory (press Enter for '{default_dir}'): ").strip()
+    return dir_input or default_dir
 
-    def list_pdfs(self):
-        print("Scanning current folder + ALL subfolders...")
-        folder = input("Enter directory to scan for AutoCAD PDFs: ").strip()
-        if not os.path.exists(folder):
-            print(Fore.RED + "Folder not found. Scanning current folder instead." + Style.RESET_ALL)
-            folder = os.getcwd()
-        self.file_cache = find_pdf(list_all=True, root=folder)
+# --- Process a single PDF file ---
+def process_pdf_file(file_path, silent=False, show_progress=False, current=0, total=0):
+    """Process a single PDF file and add to database."""
+    if not os.path.exists(file_path):
+        if not silent:
+            print(Fore.RED + f"File does not exist: {file_path}" + Style.RESET_ALL)
+        return False
 
-        if self.file_cache:
-            print(f"\nFound {len(self.file_cache)} AutoCAD-style PDFs:")
-            for i, f in enumerate(self.file_cache, 1):
-                print(f"  {i:2d}. {os.path.basename(f)}")
-            print()
-        else:
-            print(Fore.YELLOW + "No AutoCAD-style PDFs found.\n" + Style.RESET_ALL)
+    if show_progress:
+        print(Fore.BLUE + f"\r[{current}/{total}] Processing... " + Style.RESET_ALL, end='', flush=True)
 
-    def process_pdf_file(self, filename):
-        pdf_path = find_pdf(filename=filename)
-        if not pdf_path:
-            return  # Error already printed
-
-        result = process_pdf(pdf_path)  # Now returns None on EXIT_PROGRAM
-        if result is None:  # User wants to quit
-            return "EXIT"  # Signal to main loop
+    # Extract text and specs
+    text = extract_text(file_path, silent=True)
+    if text is None:
+        text = ""
     
-        description = result
-        self.last_description = description
-
-        # Cache it
-        cache = load_cache()
-        file_hash = get_file_hash(pdf_path)
-        cache[file_hash] = {"description": description, "path": pdf_path}
-        save_cache(cache)
-
-    def search_drawings(self, query):
-        print(f"Searching for: '{query}'")
-        results = search_similar_files(query)
-        if not results:
-            print(Fore.YELLOW + "No similar drawings found.\n" + Style.RESET_ALL)
-            return
-
-        cache = load_cache()
-        print(f"\n{Fore.GREEN}Found {len(results)} similar drawing(s):{Style.RESET_ALL}")
-        for file_hash, path in results:
-            desc = cache.get(file_hash, {}).get("description", "No description cached")
-            print(f"\n  File: {os.path.basename(path)}")
-            print(f"  {desc[:400]}{'...' if len(desc) > 400 else ''}")
-        print()
-
-    def clear_cache(self):
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
-            print(Fore.GREEN + "Cache cleared.\n" + Style.RESET_ALL)
+    if not text.strip():
+        ocr_text = ocr_full_document(file_path, silent=True)
+        if ocr_text is None:
+            text = ""
         else:
-            print(Fore.YELLOW + "No cache to clear.\n" + Style.RESET_ALL)
+            text = ocr_text
+    
+    specs = extract_specs_from_text(text)
+    
+    if not is_valid_specs(specs):
+        if not silent and not show_progress:
+            print(Fore.YELLOW + f"Skipped: No valid specs found in {os.path.basename(file_path)}" + Style.RESET_ALL)
+        return False
+    desc = generate_description(text,specs)
+    if not desc:
+        desc = "AutoCAD drawing (no description generated)"
 
-    def ask_about_last(self, question):
-        if not self.last_description:
-            print(Fore.YELLOW + "No description yet. Process a PDF first.\n" + Style.RESET_ALL)
+    # Add to database
+    if add_to_database(file_path, desc, specs, silent=True):
+        if not silent and not show_progress:
+            print(Fore.GREEN + f"✔ Added to database: {os.path.basename(file_path)}" + Style.RESET_ALL)
+        return True
+    else:
+        if not silent and not show_progress:
+            print(Fore.RED + f"Failed to save {os.path.basename(file_path)} to database." + Style.RESET_ALL)
+        return False
+
+# --- Interactive Q&A ---
+def interactive_qa():
+    rows = list_database_files()
+    if not rows:
+        print(Fore.YELLOW + "No files in database to query." + Style.RESET_ALL)
+        return
+
+    print(Fore.CYAN + "\nAvailable files for Q&A:" + Style.RESET_ALL)
+    for i, (fname, _, _) in enumerate(rows, 1):
+        print(f"{i}) {fname}")
+
+    choice = input("\nSelect file number to query (or press Enter to return): ").strip()
+    if not choice:
+        return
+
+    try:
+        idx = int(choice) - 1
+        if not (0 <= idx < len(rows)):
+            print(Fore.RED + "Invalid selection." + Style.RESET_ALL)
             return
-        answer = ask_question_about_description(self.last_description, question)
-        print("\n" + "="*70)
-        print("Answer:")
-        print(answer)
-        print("="*70 + "\n")
+        cache = load_cache()
+        last_dir = load_last_directory() or "C:\\"
+        file_hash = get_file_hash(os.path.join(last_dir, fname))
+        text = cache.get(file_hash, {}).get("text", "")
+
+        print(Fore.CYAN + f"\nSelected file: {fname}" + Style.RESET_ALL)
+        while True:
+            question = input("\nAsk a question (or 'exit' to return): ").strip()
+            if question.lower() == "exit":
+                break
+            answer = answer_question(question, text, specs, desc)
+            print(Fore.GREEN + "Answer:" + Style.RESET_ALL)
+            print(answer)
+    except ValueError:
+        print(Fore.RED + "Invalid input." + Style.RESET_ALL)
+
+# --- Main Menu ---
+def main():
+    last_dir = load_last_directory() or "C:\\"
+
+    while True:
+        print("\nAutoCAD PDF Finder & Explainer")
+        print("=" * 60)
+        print(" 1) List/scan PDFs in directory")
+        print(" 2) View database (filenames only)")
+        print(" 3) Search similar files")
+        print(" 4) Clear cache")
+        print(" 5) Remove file from database")
+        print(" 6) Process a single PDF")
+        print(" 7) Add all AutoCAD PDFs in directory")
+        print(" 8) Ask questions about a drawing")
+        print(" 9) Exit")
+        print("=" * 60)
+
+        choice = input("Select option (1-9): ").strip()
+
+        if choice == "1":
+            directory = prompt_directory(last_dir)
+            if not os.path.exists(directory):
+                print(Fore.RED + f"Directory not found: {directory}" + Style.RESET_ALL)
+                continue
+            save_last_directory(directory)
+            pdf_list = find_pdf(list_all=True, root=directory)
+
+        elif choice == "2":
+            files = list_database_files()
+            if not files:
+                print(Fore.YELLOW + "No files in database." + Style.RESET_ALL)
+            else:
+                print(Fore.CYAN + "\nFiles in database:" + Style.RESET_ALL)
+                for i, (fname, _, _) in enumerate(files, 1):
+                    print(f"{i}) {fname}")
+
+        elif choice == "3":
+            query = input("Enter search query: ").strip()
+            if query:
+                search_similar_files(query)
+            else:
+                print(Fore.YELLOW + "No query entered." + Style.RESET_ALL)
+
+        elif choice == "4":
+            if os.path.exists(CACHE_FILE):
+                os.remove(CACHE_FILE)
+                print(Fore.GREEN + "Cache cleared." + Style.RESET_ALL)
+            else:
+                print(Fore.YELLOW + "No cache file found." + Style.RESET_ALL)
+
+        elif choice == "5":
+            files = list_database_files()
+            if not files:
+                print(Fore.YELLOW + "Database empty." + Style.RESET_ALL)
+                continue
+            filename = input("Enter filename to remove: ").strip()
+            if filename:
+                remove_from_database(filename)
+
+        elif choice == "6":
+            directory = prompt_directory(last_dir)
+            if not os.path.exists(directory):
+                print(Fore.RED + "Invalid directory." + Style.RESET_ALL)
+                continue
+            fname = input("Enter PDF filename (full or partial): ").strip()
+            pdfs = find_pdf(list_all=True, root=directory)
+            match = next((f for f in pdfs if fname.lower() in os.path.basename(f).lower()), None)
+            if match:
+                process_pdf_file(match, silent=False)
+            else:
+                print(Fore.RED + "File not found or not AutoCAD." + Style.RESET_ALL)
+
+        elif choice == "7":
+            directory = prompt_directory(last_dir)
+            if not os.path.exists(directory):
+                print(Fore.RED + "Invalid directory." + Style.RESET_ALL)
+                continue
+            save_last_directory(directory)
+            pdf_list = find_pdf(list_all=True, root=directory)
+            
+            if not pdf_list:
+                print(Fore.YELLOW + "No verified AutoCAD PDFs found." + Style.RESET_ALL)
+                continue
+            
+            confirm = input(f"Add all {len(pdf_list)} PDFs to database? (y/N): ").strip().lower()
+            if confirm == "y":
+                print(Fore.CYAN + f"\nProcessing {len(pdf_list)} files..." + Style.RESET_ALL)
+                added = 0
+                for idx, f in enumerate(pdf_list, 1):
+                    if process_pdf_file(f, silent=True, show_progress=True, current=idx, total=len(pdf_list)):
+                        added += 1
+                
+                # Clear progress line and show final result
+                print(Fore.GREEN + f"\r[{len(pdf_list)}/{len(pdf_list)}] Complete! Added {added} PDFs to database." + Style.RESET_ALL + " " * 20)
+        elif choice == "8":
+            interactive_qa()
+        elif choice == "9":
+            print("Goodbye!")
+            break
+        else:
+            print(Fore.RED + "Invalid selection (1-9)." + Style.RESET_ALL)
 
 if __name__ == "__main__":
-    system = AutoCADFinder()
-    system.run()
+    main()

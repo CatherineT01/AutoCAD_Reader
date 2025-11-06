@@ -1,162 +1,76 @@
 # semanticMemory.py
-import os
+import chromadb
 import json
-import base64
-import numpy as np
-from io import BytesIO
-from utils import client, load_cache, save_cache, CACHE_FILE, INDEX_FILE, META_FILE
+from colorama import Fore, Style
 
-# ----------------------------------------------------------------------
-# 1. Text embedding (used for description + OCR fallback)
-# ----------------------------------------------------------------------
-def get_text_embedding(text: str):
+# Initialize ChromaDB client and collection
+client = chromadb.Client()
+collection = client.get_or_create_collection("drawing_memory")
+
+def add_to_database(filename, description, specs, silent=False):
+    """Add or update a drawing entry in ChromaDB."""
     try:
-        resp = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text
+        try:
+            collection.delete(ids=[filename])
+        except:
+            pass
+        
+        collection.add(
+            ids=[filename],
+            documents=[description],
+            metadatas=[{"specs": json.dumps(specs)}]
         )
-        return resp.data[0].embedding
+        if not silent:
+            print(Fore.GREEN + f"Added to database: {filename}" + Style.RESET_ALL)
+        return True
     except Exception as e:
-        print(f"[Embedding error] {e}")
-        return None
+        if not silent:
+            print(Fore.RED + f"Error adding {filename} to database: {e}" + Style.RESET_ALL)
+        return False
 
-
-# ----------------------------------------------------------------------
-# 2. OPTIONAL: Vision embedding (gpt-4o) – a *second* vector for the image
-# ----------------------------------------------------------------------
-def get_image_embedding(pdf_path: str):
-    """
-    Sends the **first page** of the PDF to gpt-4o (vision) and returns the
-    embedding that OpenAI returns for that image.
-    """
+def list_database_files():
+    """Return all stored files without showing all data unless requested."""
     try:
-        # Convert first page to base64 PNG
-        from pdf2image import convert_from_path
-        from PDF_Analyzer import POPPLER_PATH
-        pages = convert_from_path(pdf_path, first_page=1, last_page=1,
-                                  dpi=300, poppler_path=POPPLER_PATH)
-        img = pages[0]
-        buffered = BytesIO()
-        img.save(buffered, format="PNG")
-        b64 = base64.b64encode(buffered.getvalue()).decode()
+        results = collection.get()
+        ids = results.get("ids", [])
+        docs = results.get("documents", [])
+        metas = results.get("metadatas", [])
 
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Return an embedding for this technical drawing."},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{b64}"}}
-                ]
-            }],
-            # OpenAI returns an embedding when you ask for it in the response format
-            extra_body={"response_format": {"type": "json_object"}}
-        )
-        # The embedding is under resp.choices[0].message.content (JSON string)
-        data = json.loads(resp.choices[0].message.content)
-        return data.get("embedding")
+        if not ids:
+            print(Fore.YELLOW + "No files in database." + Style.RESET_ALL)
+            return []
+
+        # Print only the file list
+        print(Fore.CYAN + "\nFiles currently in database:" + Style.RESET_ALL)
+        for i, fid in enumerate(ids, 1):
+            print(f"{i}) {fid}")
+
+        # Return structured data for interactive_qa()
+        return list(zip(ids, docs, [m.get("specs", "{}") for m in metas]))
+
     except Exception as e:
-        print(f"[Vision embedding error] {e}")
-        return None
-
-
-# ----------------------------------------------------------------------
-# 3. Build the FAISS-style JSON index
-# ----------------------------------------------------------------------
-def build_index():
-    cache = load_cache()
-    embeddings = []          # list of np.float32 vectors
-    metadata   = []          # list of (hash, path)
-
-    for file_hash, entry in cache.items():
-        # --------------------------------------------------------------
-        # 3a – Text vector (description + optional OCR)
-        # --------------------------------------------------------------
-        if "embedding" not in entry:
-            txt = entry.get("description", "")
-            ocr = entry.get("ocr_text", "")
-            full_txt = txt + "\n" + ocr
-            vec = get_text_embedding(full_txt)
-            if vec:
-                entry["embedding"] = vec
-
-        # --------------------------------------------------------------
-        # 3b – OPTIONAL Vision vector (adds a second vector per file)
-        # --------------------------------------------------------------
-        if "vision_embedding" not in entry and "path" in entry:
-            v_vec = get_image_embedding(entry["path"])
-            if v_vec:
-                entry["vision_embedding"] = v_vec
-
-        # --------------------------------------------------------------
-        # 3c – Store the *primary* text embedding
-        # --------------------------------------------------------------
-        if "embedding" in entry:
-            embeddings.append(np.array(entry["embedding"], dtype="float32"))
-            metadata.append((file_hash, entry.get("path", "")))
-
-    # Save updated cache (now contains embeddings)
-    save_cache(cache)
-
-    if not embeddings:
-        print("Nothing to index.")
-        return
-
-    # ------------------------------------------------------------------
-    # Write a simple JSON index (you can replace this with FAISS later)
-    # ------------------------------------------------------------------
-    index_data = {
-        "embeddings": [e.tolist() for e in embeddings],
-        "metadata": metadata
-    }
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(index_data, f, indent=2)
-
-    print(f"Index built – {len(embeddings)} text vectors (vision vectors stored in cache)")
-
-
-# ----------------------------------------------------------------------
-# 4. Search – text query against text embeddings
-# ----------------------------------------------------------------------
-def search_similar_files(query: str, top_k: int = 3):
-    if not os.path.exists(INDEX_FILE):
-        print("Run 'build index' first.")
+        print(Fore.RED + f"Error listing database files: {e}" + Style.RESET_ALL)
         return []
 
-    q_vec = get_text_embedding(query)
-    if not q_vec:
-        return []
+def remove_from_database(filename):
+    """Remove a file by its filename."""
+    try:
+        collection.delete(ids=[filename])
+        print(Fore.GREEN + f"Removed {filename} from database." + Style.RESET_ALL)
+    except Exception as e:
+        print(Fore.RED + f"Error removing {filename}: {e}" + Style.RESET_ALL)
 
-    with open(INDEX_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    embeddings = np.array(data["embeddings"], dtype="float32")
-    metadata   = data["metadata"]
-
-    q_vec = np.array(q_vec, dtype="float32").reshape(1, -1)
-    distances = np.linalg.norm(embeddings - q_vec, axis=1)
-    top_idx   = np.argsort(distances)[:top_k]
-
-    return [metadata[i] for i in top_idx]
-
-
-# ----------------------------------------------------------------------
-# 5. OPTIONAL: Vision-only search (if you want to query with an image)
-# ----------------------------------------------------------------------
-def search_by_image(pdf_path: str, top_k: int = 3):
-    """Search using the *vision* embedding of the supplied PDF."""
-    cache = load_cache()
-    q_vec = get_image_embedding(pdf_path)
-    if not q_vec:
-        return []
-
-    matches = []
-    for h, entry in cache.items():
-        v_vec = entry.get("vision_embedding")
-        if v_vec:
-            dist = np.linalg.norm(np.array(v_vec) - np.array(q_vec))
-            matches.append((dist, h, entry.get("path", "")))
-
-    matches.sort(key=lambda x: x[0])
-    return [(h, path) for _, h, path in matches[:top_k]]
+def search_similar_files(query):
+    """Search ChromaDB for drawings similar to a given query."""
+    try:
+        results = collection.query(query_texts=[query], n_results=5)
+        matches = results.get("ids", [[]])[0]
+        docs = results.get("documents", [[]])[0]
+        if not matches:
+            print(Fore.YELLOW + "No similar files found." + Style.RESET_ALL)
+            return
+        print(Fore.CYAN + f"\nTop matches for '{query}':" + Style.RESET_ALL)
+        for i, (fid, desc) in enumerate(zip(matches, docs), 1):
+            print(f"{i}) {fid} — {desc[:100]}...")
+    except Exception as e:
+        print(Fore.RED + f"Error during search: {e}" + Style.RESET_ALL)
