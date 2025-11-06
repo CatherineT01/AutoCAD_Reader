@@ -1,32 +1,25 @@
-# utils.py
+#utils.py
+#**************************************************************************************************
+#   utils.py provides utility functions for interacting with AI models (Grok and OpenAI), 
+#   caching file descriptions, and cleaning extracted specifications.
+#**************************************************************************************************
 from dotenv import load_dotenv
 import os
 import json
 import hashlib
 import httpx
+import time
+import re
+from colorama import Fore, Style
 from openai import OpenAI
-from colorama import init, Fore, Style
-import subprocess
 
-init(autoreset=True)
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
-CACHE_FILE = os.path.join(os.path.dirname(__file__), "description_cache.json")
 
-# Initialize OpenAI client
-if not OPENAI_API_KEY:
-    print(Fore.YELLOW + "OPENAI_API_KEY not set. Fallback disabled. Get it from https://platform.openai.com." + Style.RESET_ALL)
-    openai_client = None
-else:
-    try:
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        print(Fore.RED + f"Failed to initialize OpenAI client: {e}" + Style.RESET_ALL)
-        openai_client = None
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Grok client wrapper
 class GrokClient:
     def __init__(self, api_key):
         self.api_key = api_key
@@ -36,31 +29,18 @@ class GrokClient:
             "Content-Type": "application/json"
         }
 
-    def chat(self, messages, model="grok-3-beta"):
-        payload = {
-            "model": model,
-            "messages": messages
-        }
+    def chat(self, messages, model="grok-3-fast-beta"):
+        payload = {"model": model, "messages": messages}
         try:
             response = httpx.post(self.endpoint, headers=self.headers, json=payload, timeout=30.0)
             response.raise_for_status()
             return response.json()
-        except httpx.HTTPStatusError as e:
-            print(Fore.RED + f"Grok API error: {e.response.status_code} - {e.response.text}" + Style.RESET_ALL)
-        except Exception as e:
-            print(Fore.RED + f"Grok request failed: {e}" + Style.RESET_ALL)
-        return None
+        except:
+            return None
 
-# Initialize Grok client
-if not GROK_API_KEY:
-    print(Fore.YELLOW + "GROK_API_KEY not set. Get it from https://console.grok.com." + Style.RESET_ALL)
-    grok_client = None
-else:
-    grok_client = GrokClient(GROK_API_KEY)
+grok_client = GrokClient(GROK_API_KEY) if GROK_API_KEY else None
 
-BASE_DIR = os.path.dirname(__file__)
-INDEX_FILE = os.path.join(BASE_DIR, "vector_index.json")
-META_FILE = os.path.join(BASE_DIR, "vector_metadata.json")
+CACHE_FILE = os.path.join(os.path.dirname(__file__), "description_cache.json")
 
 def load_cache():
     try:
@@ -73,8 +53,8 @@ def save_cache(cache):
     try:
         with open(CACHE_FILE, 'w') as f:
             json.dump(cache, f, indent=2)
-    except Exception as e:
-        print(Fore.RED + f"Failed to save cache: {e}" + Style.RESET_ALL)
+    except:
+        pass
 
 def get_file_hash(path):
     try:
@@ -83,51 +63,70 @@ def get_file_hash(path):
             for chunk in iter(lambda: f.read(4096), b""):
                 hasher.update(chunk)
         return hasher.hexdigest()
-    except Exception as e:
-        print(Fore.RED + f"Failed to hash file {path}: {e}" + Style.RESET_ALL)
+    except:
         return None
 
-def is_poppler_available():
-    try:
-        subprocess.run(["pdfinfo", "-v"], capture_output=True, check=True)
-        return True
-    except Exception:
-        return False
-
 def is_valid_specs(specs):
-    """Check if specs contain meaningful data."""
-    return bool(specs and any(key in specs for key in ["Scale", "Dimensions", "Revision", "Title", "Drawing Number"]))
+    if not specs:
+        return False
+    for value in specs.values():
+        if value:
+            return True
+    return False
+
+def clean_specs(specs):
+    """Remove noise and clean up extracted specs."""
+    if not specs:
+        return specs
+    
+    cleaned = {}
+    noise_patterns = [
+        r"^(is the sole property|any reproduction|approved)",
+        r"^(rev date description)",
+        r"^\s*$",
+    ]
+    
+    for key, value in specs.items():
+        if isinstance(value, list):
+            cleaned_list = []
+            for item in value:
+                item_str = str(item).strip()
+                is_noise = any(re.search(pattern, item_str, re.IGNORECASE) for pattern in noise_patterns)
+                if not is_noise and len(item_str) > 1:
+                    cleaned_list.append(item_str)
+            if cleaned_list:
+                cleaned[key] = cleaned_list
+        elif isinstance(value, str):
+            value_str = value.strip()
+            is_noise = any(re.search(pattern, value_str, re.IGNORECASE) for pattern in noise_patterns)
+            if not is_noise and len(value_str) > 1:
+                cleaned[key] = value_str
+    
+    return cleaned
 
 def chat_with_ai(prompt, model="grok-3-fast-beta", temperature=0.4, max_tokens=300, silent=False):
-    """Try Grok first, then OpenAI, with better error handling."""
+    """Try Grok first, then OpenAI."""
     messages = [{"role": "user", "content": prompt}]
     
-    # Try Grok first
     if grok_client:
         try:
             if not silent:
-                print(Fore.BLUE + "[→] Trying Grok..." + Style.RESET_ALL)
+                print(Fore.BLUE + "Using Grok..." + Style.RESET_ALL)
             resp = grok_client.chat(messages, model=model)
             if resp and "choices" in resp and len(resp["choices"]) > 0:
                 result = resp["choices"][0]["message"]["content"].strip()
                 if not silent:
-                    print(Fore.GREEN + "[✓] Grok responded successfully." + Style.RESET_ALL)
+                    print(Fore.GREEN + "Grok responded" + Style.RESET_ALL)
                 return result
-            else:
-                if not silent:
-                    print(Fore.YELLOW + f"[!] Grok returned unexpected format: {resp}" + Style.RESET_ALL)
         except Exception as e:
             if not silent:
-                print(Fore.YELLOW + f"[!] Grok failed with error: {e}" + Style.RESET_ALL)
-    else:
-        if not silent:
-            print(Fore.YELLOW + "[!] Grok client not initialized." + Style.RESET_ALL)
+                print(Fore.YELLOW + f"Grok failed: {e}" + Style.RESET_ALL)
     
     # Fallback to OpenAI
     if openai_client:
         try:
             if not silent:
-                print(Fore.BLUE + "[→] Falling back to OpenAI..." + Style.RESET_ALL)
+                print(Fore.BLUE + "Using OpenAI..." + Style.RESET_ALL)
             resp = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
@@ -136,15 +135,9 @@ def chat_with_ai(prompt, model="grok-3-fast-beta", temperature=0.4, max_tokens=3
             )
             result = resp.choices[0].message.content.strip()
             if not silent:
-                print(Fore.GREEN + "[✓] OpenAI responded successfully." + Style.RESET_ALL)
+                print(Fore.GREEN + "OpenAI responded" + Style.RESET_ALL)
             return result
         except Exception as e:
             if not silent:
-                print(Fore.RED + f"[!] OpenAI fallback also failed: {e}" + Style.RESET_ALL)
-    else:
-        if not silent:
-            print(Fore.YELLOW + "[!] OpenAI client not initialized." + Style.RESET_ALL)
-    
-    if not silent:
-        print(Fore.RED + "[✗] Both Grok and OpenAI failed to respond." + Style.RESET_ALL)
+                print(Fore.RED + f"OpenAI failed: {e}" + Style.RESET_ALL)
     return None

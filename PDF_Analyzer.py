@@ -1,338 +1,404 @@
+#PDF_Analyzer.py
+#**************************************************************************************************
+#   Refactored PDF_Analyzer with config integration
+#   Extracts text from PDF files, adds files to semantic database, and enables Q&A
+#**************************************************************************************************
 import os
 import json
-import fitz 
-import pdfplumber
-from pdf2image import convert_from_path
+from colorama import init, Fore, Style
+init(autoreset=True)
 import pytesseract
+from pdf2image import convert_from_path
 from PIL import Image
 import numpy as np
 import cv2
-from colorama import init, Fore, Style
-init(autoreset=True)
 
-from utils import openai_client, grok_client, load_cache, save_cache, get_file_hash, CACHE_FILE, is_valid_specs,is_poppler_available,chat_with_ai
+# Import configuration
+from config import (
+    TESSERACT_PATH, POPPLER_PATH, OCR_DPI, OCR_LANG, 
+    OCR_PSM, OCR_OEM, GROK_MODEL, OPENAI_MODEL,
+    DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, ENABLE_OCR
+)
+from utils import grok_client, openai_client, chat_with_ai, clean_specs
+from semanticMemory import add_to_database, file_exists_in_database, list_database_files
 
-# --- Paths ---
-BASE_DIR = os.path.dirname(__file__)
-POPPLER_PATH = os.path.join(BASE_DIR, "poppler", "bin")
-TESSERACT_PATH = os.path.join(BASE_DIR, "tesseract", "tesseract.exe")
+# Set Tesseract path from config
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
+def is_poppler_available():
+    """Check if Poppler is available for PDF to image conversion."""
+    pdfinfo_exe = os.path.join(POPPLER_PATH, "pdfinfo.exe")
+    return os.path.exists(pdfinfo_exe) and os.access(pdfinfo_exe, os.X_OK)
+
+# Check OCR availability
+OCR_AVAILABLE = (
+    ENABLE_OCR and 
+    TESSERACT_PATH is not None and 
+    os.path.exists(TESSERACT_PATH) and 
+    is_poppler_available()
+)
+
+if not OCR_AVAILABLE:
+    print(Fore.RED + "⚠ OCR dependencies missing! Check config.py" + Style.RESET_ALL)
+else:
+    print(Fore.GREEN + "✓ OCR dependencies recognized" + Style.RESET_ALL)
+
+def extract_text(pdf_path, silent=False):
+    """Extract embedded text from PDF using multiple methods."""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        text = "\n".join([page.get_text() or "" for page in doc])
+        if text.strip():
+            if not silent: 
+                print(Fore.GREEN + "✓ Text extracted via PyMuPDF" + Style.RESET_ALL)
+            return text
+    except Exception as e:
+        if not silent:
+            print(Fore.YELLOW + f"PyMuPDF failed: {e}" + Style.RESET_ALL)
+    
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+            if text.strip():
+                if not silent: 
+                    print(Fore.GREEN + "✓ Text extracted via pdfplumber" + Style.RESET_ALL)
+                return text
+    except Exception as e:
+        if not silent:
+            print(Fore.YELLOW + f"pdfplumber failed: {e}" + Style.RESET_ALL)
+    
+    if not silent: 
+        print(Fore.YELLOW + "⚠ No embedded text found" + Style.RESET_ALL)
+    return ""
+
+def _preprocess_page(img):
+    """Preprocess image for better OCR results."""
+    img = img.convert("L")
+    arr = np.array(img)
+    arr = cv2.bilateralFilter(arr, 15, 25, 25)
+    arr = cv2.adaptiveThreshold(arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 15, 5)
+    arr = cv2.equalizeHist(arr)
+    return Image.fromarray(arr)
+
+def ocr_full_document(pdf_path, silent=False):
+    """Perform OCR on entire PDF document."""
+    if not OCR_AVAILABLE:
+        if not silent: 
+            print(Fore.YELLOW + "[!] OCR skipped (not configured)" + Style.RESET_ALL)
+        return ""
+    try:
+        pages = convert_from_path(pdf_path, dpi=OCR_DPI, poppler_path=POPPLER_PATH)
+        all_text = ""
+        for i, page in enumerate(pages, 1):
+            processed = _preprocess_page(page)
+            config_str = f'--psm {OCR_PSM} --oem {OCR_OEM}'
+            text = pytesseract.image_to_string(processed, lang=OCR_LANG, config=config_str)
+            all_text += text + "\n"
+            if not silent: 
+                print(Fore.CYAN + f"  ✓ OCR page {i}/{len(pages)}" + Style.RESET_ALL)
+        return all_text
+    except Exception as e:
+        if not silent: 
+            print(Fore.RED + f"✗ OCR failed: {e}" + Style.RESET_ALL)
+        return ""
+
+def is_autocad_drawing_with_ai_fallback(pdf_path, text, silent=False):
+    """Use AI to determine if PDF contains an AutoCAD drawing."""
+    if not text.strip(): 
+        return False
+    
+    prompt = f"""Is this text from a technical AutoCAD/CAD drawing?
+
+Text: {text[:3000]}
+
+Answer ONLY 'Yes' or 'No'."""
+
+    if grok_client:
+        try:
+            if not silent: 
+                print(Fore.BLUE + "→ Validating with Grok..." + Style.RESET_ALL, end=' ')
+            resp = grok_client.chat(
+                [{"role": "user", "content": prompt}], 
+                model=GROK_MODEL
+            )
+            if resp and "choices" in resp:
+                result = resp["choices"][0]["message"]["content"].strip().lower()
+                if not silent: 
+                    print(Fore.GREEN + ("✓ Yes" if "yes" in result else "✗ No") + Style.RESET_ALL)
+                return "yes" in result
+        except Exception as e:
+            if not silent:
+                print(Fore.YELLOW + f"Grok error: {e}" + Style.RESET_ALL)
+    
+    if openai_client:
+        try:
+            if not silent: 
+                print(Fore.BLUE + "→ Validating with OpenAI..." + Style.RESET_ALL, end=' ')
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0, 
+                max_tokens=10
+            )
+            result = resp.choices[0].message.content.strip().lower()
+            if not silent: 
+                print(Fore.GREEN + ("✓ Yes" if "yes" in result else "✗ No") + Style.RESET_ALL)
+            return "yes" in result
+        except Exception as e:
+            if not silent:
+                print(Fore.YELLOW + f"OpenAI error: {e}" + Style.RESET_ALL)
+    
+    return False
+
+def extract_specs_with_ai(text, silent=False):
+    """Extract technical specifications from text using AI."""
+    if not text.strip(): 
+        return {}
+    
+    prompt = f"""Extract technical specifications from this AutoCAD drawing text into a JSON object.
+Include fields like: title, drawing_number, scale, dimensions, materials, notes, revisions, etc.
+
+Text: {text[:4000]}
+
+Return ONLY valid JSON, no markdown formatting."""
+
+    if grok_client:
+        try:
+            if not silent: 
+                print(Fore.BLUE + "→ Extracting specs with Grok..." + Style.RESET_ALL, end=' ')
+            resp = grok_client.chat(
+                [{"role": "user", "content": prompt}], 
+                model=GROK_MODEL
+            )
+            if resp and "choices" in resp:
+                result = resp["choices"][0]["message"]["content"].strip()
+                # Remove markdown code blocks
+                if result.startswith("```"):
+                    result = '\n'.join([line for line in result.split('\n') 
+                                      if not line.strip().startswith("```")])
+                specs = clean_specs(json.loads(result))
+                if not silent: 
+                    print(Fore.GREEN + f"✓ {len(specs)} fields" + Style.RESET_ALL)
+                return specs
+        except Exception as e:
+            if not silent:
+                print(Fore.YELLOW + f"Grok parse error: {e}" + Style.RESET_ALL)
+    
+    if openai_client:
+        try:
+            if not silent: 
+                print(Fore.BLUE + "→ Extracting specs with OpenAI..." + Style.RESET_ALL, end=' ')
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=DEFAULT_TEMPERATURE, 
+                max_tokens=DEFAULT_MAX_TOKENS
+            )
+            result = resp.choices[0].message.content.strip()
+            # Remove markdown code blocks
+            if result.startswith("```"):
+                result = '\n'.join([line for line in result.split('\n') 
+                                  if not line.strip().startswith("```")])
+            specs = clean_specs(json.loads(result))
+            if not silent: 
+                print(Fore.GREEN + f"✓ {len(specs)} fields" + Style.RESET_ALL)
+            return specs
+        except Exception as e:
+            if not silent:
+                print(Fore.YELLOW + f"OpenAI parse error: {e}" + Style.RESET_ALL)
+    
+    return {}
+
+def generate_description(specs, text, pdf_path=None, silent=False):
+    """Generate natural language description using AI."""
+    prompt = f"""Create a brief technical description (2-3 sentences) of this AutoCAD drawing.
+
+Specifications: {json.dumps(specs)}
+Text sample: {text[:500]}
+
+Be concise and technical."""
+
+    if grok_client:
+        try:
+            if not silent: 
+                print(Fore.BLUE + "→ Generating description with Grok..." + Style.RESET_ALL)
+            resp = grok_client.chat(
+                [{"role": "user", "content": prompt}], 
+                model=GROK_MODEL
+            )
+            if resp and "choices" in resp:
+                return resp["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if not silent:
+                print(Fore.YELLOW + f"Grok error: {e}" + Style.RESET_ALL)
+    
+    if openai_client:
+        try:
+            if not silent: 
+                print(Fore.BLUE + "→ Generating description with OpenAI..." + Style.RESET_ALL)
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=DEFAULT_TEMPERATURE, 
+                max_tokens=200
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            if not silent:
+                print(Fore.YELLOW + f"OpenAI error: {e}" + Style.RESET_ALL)
+    
+    # Fallback description
+    return f"AutoCAD drawing: {os.path.basename(pdf_path) if pdf_path else 'Unknown'}"
+
+def process_pdf(pdf_path, silent=False):
+    """Main PDF processing pipeline."""
+    if not os.path.exists(pdf_path):
+        if not silent: 
+            print(Fore.RED + f"✗ File not found: {pdf_path}" + Style.RESET_ALL)
+        return False
+    
+    if file_exists_in_database(pdf_path):
+        if not silent: 
+            print(Fore.YELLOW + "⚠ Already in database, skipping" + Style.RESET_ALL)
+        return True
+    
+    # Extract text
+    text = extract_text(pdf_path, silent=silent)
+    if not text.strip() and OCR_AVAILABLE:
+        if not silent:
+            print(Fore.CYAN + "→ Attempting OCR..." + Style.RESET_ALL)
+        text = ocr_full_document(pdf_path, silent=silent)
+    
+    if not text.strip():
+        if not silent: 
+            print(Fore.RED + "✗ No text extracted" + Style.RESET_ALL)
+        return False
+    
+    # Validate it's an AutoCAD drawing
+    if not is_autocad_drawing_with_ai_fallback(pdf_path, text, silent=silent):
+        if not silent: 
+            print(Fore.YELLOW + "⚠ Not an AutoCAD drawing" + Style.RESET_ALL)
+        return False
+    
+    # Extract specifications
+    specs = extract_specs_with_ai(text, silent=silent)
+    
+    # Generate description
+    description = generate_description(specs, text, pdf_path, silent=silent)
+    
+    # Add to database
+    success = add_to_database(pdf_path, description, specs, silent=silent)
+    if success and not silent: 
+        print(Fore.GREEN + f"✓ {os.path.basename(pdf_path)} added to database" + Style.RESET_ALL)
+    
+    return success
+
 def find_pdf(list_all=False, root="."):
-    """
-    Scan the given directory (and subfolders) for likely AutoCAD PDFs.
-    Only PDFs that pass is_autocad_pdf() are returned.
-    """
-    # First, count all PDFs
+    """Find PDF files that contain AutoCAD drawings."""
     all_pdfs = []
     for dirpath, _, files in os.walk(root):
         for f in files:
             if f.lower().endswith(".pdf"):
-                all_pdfs.append(os.path.join(dirpath, f))
+                full_path = os.path.join(dirpath, f)
+                if not file_exists_in_database(full_path):
+                    all_pdfs.append(full_path)
     
-    total_pdfs = len(all_pdfs)
-    print(Fore.CYAN + f"\nScanning {total_pdfs} PDF files in directory..." + Style.RESET_ALL)
+    total = len(all_pdfs)
+    print(Fore.CYAN + f"\n→ Scanning {total} PDF files..." + Style.RESET_ALL)
     
-    matches = []
-    for idx, path in enumerate(all_pdfs, 1):
-        f = os.path.basename(path)
-        try:
-            # Show progress on same line
-            print(Fore.BLUE + f"\r[{idx}/{total_pdfs}] Processing... {len(matches)} AutoCAD PDFs found" + Style.RESET_ALL, end='', flush=True)
-            
-            if is_autocad_pdf(path, silent=True):
-                matches.append(path)
-        except Exception as e:
-            pass  # Silent error handling
+    autocad_pdfs = []
+    for idx, pdf_path in enumerate(all_pdfs, 1):
+        text = extract_text(pdf_path, silent=True)
+        if not text.strip() and OCR_AVAILABLE:
+            text = ocr_full_document(pdf_path, silent=True)
+        if text.strip() and is_autocad_drawing_with_ai_fallback(pdf_path, text, silent=True):
+            autocad_pdfs.append(pdf_path)
     
-    # Clear the progress line and show final result
-    print(Fore.GREEN + f"\r[{total_pdfs}/{total_pdfs}] Complete! Found {len(matches)} AutoCAD PDFs" + Style.RESET_ALL + " " * 20)
+    print(Fore.GREEN + f"✓ Found {len(autocad_pdfs)} AutoCAD PDFs" + Style.RESET_ALL)
     
     if list_all:
-        print(Fore.CYAN + f"\n{'='*60}" + Style.RESET_ALL)
-        print(Fore.CYAN + f"Verified AutoCAD PDFs:" + Style.RESET_ALL)
-        print(Fore.CYAN + f"{'='*60}" + Style.RESET_ALL)
-        for i, m in enumerate(matches, 1):
-            print(f"{i}) {m}")
+        for i, pdf in enumerate(autocad_pdfs, 1):
+            print(f"{i}) {os.path.basename(pdf)}")
     
-    return matches
+    return autocad_pdfs
 
-def is_autocad_pdf(pdf_path, silent=False):
-    """Use AI to determine if a PDF is an AutoCAD drawing with robust fallback."""
-    text = extract_text(pdf_path, silent=True)
+def answer_question(question, text="", specs=None, description="", silent=False):
+    """
+    Answer questions about a drawing using AI.
     
-    # Handle None returns from extract_text
-    if text is None:
-        text = ""
-    
-    if not text.strip():
-        ocr_text = ocr_full_document(pdf_path, silent=True)
-        # Handle None returns from OCR
-        if ocr_text is None:
-            text = ""
-        else:
-            text = ocr_text
+    Args:
+        question: Question to ask
+        text: Extracted text from drawing
+        specs: Specifications dict
+        description: Generated description
+        silent: Suppress output
+        
+    Returns:
+        Answer string or "Unknown"
+    """
+    if not question or not isinstance(question, str):
+        return "Invalid question."
 
-    # If still no text, assume it might be AutoCAD (images/drawings often have no text)
-    if not text.strip():
-        if not silent:
-            print(Fore.YELLOW + f"[!] No text extracted from {os.path.basename(pdf_path)} - treating as potential AutoCAD drawing." + Style.RESET_ALL)
-        return True  # Many AutoCAD PDFs are image-based
+    # Ensure text is always a string
+    pdf_text = text if isinstance(text, str) else ""
+    if not pdf_text.strip():
+        pdf_text = (description or "") + "\n" + json.dumps(specs or {}, indent=2)
 
-    prompt = f"""
-You are an AutoCAD expert.
-The following text was extracted from a PDF document:
+    # Ensure specs is always a dict
+    if not isinstance(specs, dict):
+        try:
+            specs = json.loads(specs) if specs else {}
+        except Exception:
+            specs = {}
 
-{text[:3000]}
+    # Ensure description is a string
+    if not isinstance(description, str):
+        description = str(description)
 
-Determine if this PDF contains a technical AutoCAD drawing.
-Answer ONLY 'Yes' or 'No' with no additional text.
-"""
-    
-    # Try with Grok/OpenAI fallback
-    answer = chat_with_ai(prompt, temperature=0, silent=True)
-    
-    if not answer:
-        if not silent:
-            print(Fore.YELLOW + f"[!] AI unavailable for {os.path.basename(pdf_path)} - including by default." + Style.RESET_ALL)
-        return True  # Include file if AI check fails
-    
-    answer = answer.strip().lower()
-    
-    # More flexible answer parsing
-    if "yes" in answer or answer.startswith("y"):
-        return True
-    elif "no" in answer or answer.startswith("n"):
-        return False
-    else:
-        # If unclear response, be permissive and include it
-        if not silent:
-            print(Fore.YELLOW + f"[!] Unclear AI response for {os.path.basename(pdf_path)}: '{answer}' - including by default." + Style.RESET_ALL)
-        return True
-# ============================================================
-# TEXT EXTRACTION
-# ============================================================
-def extract_text(pdf_path, silent=False):
-    """Try to extract text from the PDF using pdfplumber and PyMuPDF."""
-    text = ""
-    # Try pdfplumber
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-        if text.strip():
-            if not silent:
-                print(Fore.GREEN + "[✓] Text extracted with pdfplumber." + Style.RESET_ALL)
-            return text
-    except Exception as e:
-        if not silent:
-            print(Fore.YELLOW + f"[!] pdfplumber failed: {e}. Trying PyMuPDF..." + Style.RESET_ALL)
-    
-    # Fallback to PyMuPDF
-    try:
-        with fitz.open(pdf_path) as doc:
-            text = "\n".join(page.get_text() or "" for page in doc)
-        if text.strip():
-            if not silent:
-                print(Fore.GREEN + "[✓] Text extracted with PyMuPDF." + Style.RESET_ALL)
-            return text
-        else:
-            if not silent:
-                print(Fore.YELLOW + "[!] No embedded text found. Switching to OCR..." + Style.RESET_ALL)
-            return ""  # Changed from None to empty string
-    except Exception as e:
-        if not silent:
-            print(Fore.RED + f"[✗] PyMuPDF failed: {e}. Switching to OCR..." + Style.RESET_ALL)
-        return ""
+    # Build prompt
+    prompt = f"""You are an expert analyzing technical AutoCAD drawings.
+Answer the following question based ONLY on the provided content.
 
-# ============================================================
-# OCR EXTRACTION
-# ============================================================
-def _preprocess_page(img, pdf_path):
-    """Enhance image for OCR with multiple preprocessing techniques."""
-    try:
-        img = img.convert("L")  # Convert to grayscale
-        arr = np.array(img)
-        # Apply bilateral filter for noise reduction
-        arr = cv2.bilateralFilter(arr, 11, 17, 17)
-        # Adaptive thresholding
-        arr = cv2.adaptiveThreshold(arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        # Additional contrast enhancement
-        arr = cv2.equalizeHist(arr)
-        return Image.fromarray(arr)
-    except Exception as e:
-        print(Fore.RED + f"[✗] Preprocessing failed for {os.path.basename(pdf_path)}: {e}" + Style.RESET_ALL)
-        return img
+Drawing Content (first 3000 chars):
+{pdf_text[:3000]}
 
-def ocr_full_document(pdf_path, silent=False):
-    """Run OCR on all pages with enhanced preprocessing."""
-    if not is_poppler_available():
-        if not silent:
-            print(Fore.YELLOW + "[!] OCR skipped: Poppler not installed or not in PATH." + Style.RESET_ALL)
-        return ""  # Changed from None to empty string
-
-    try:
-        pages = convert_from_path(pdf_path, dpi=300)
-        all_text = ""
-        for i, page in enumerate(pages, 1):
-            processed = _preprocess_page(page, pdf_path)
-            text = pytesseract.image_to_string(processed, lang="eng", config='--psm 6')
-            all_text += text + "\n"
-            if not silent:
-                print(Fore.CYAN + f"OCR processed page {i}/{len(pages)}" + Style.RESET_ALL)
-        if all_text.strip():
-            if not silent:
-                print(Fore.GREEN + "[✓] OCR completed successfully." + Style.RESET_ALL)
-        else:
-            if not silent:
-                print(Fore.YELLOW + "[!] OCR found no readable text." + Style.RESET_ALL)
-        return all_text
-    except Exception as e:
-        if not silent:
-            print(Fore.RED + f"[✗] OCR failed: {e}" + Style.RESET_ALL)
-        return ""
-
-# ============================================================
-# SPECIFICATION PARSING
-# ============================================================
-def extract_specs_from_text(text):
-    """Extract structured data from text (dimensions, scale, title, etc.)."""
-    specs = {}
-    if not text.strip():
-        return specs
-    try:
-        import re
-        lines = text.splitlines()
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # Scale
-            if re.search(r"\bscale\b.*?\b\d+[:]\d+\b", line, re.I) or "scale" in line.lower():
-                specs["Scale"] = line
-            # Dimensions
-            if re.search(r"\b\d+(\.\d+)?\s*(mm|cm|m|in|ft)\b", line, re.I):
-                specs.setdefault("Dimensions", []).append(line)
-            # Revision
-            if re.search(r"\brev(ision)?\b.*?\d+", line, re.I):
-                specs["Revision"] = line
-            # Title or Drawing Number
-            if re.search(r"\b(title|drawing no\.|dwg no\.)\b", line, re.I):
-                specs["Title"] = line
-            # Common AutoCAD metadata
-            if re.search(r"\b(project|sheet|drawn by|checked by|date)\b", line, re.I):
-                key = line.split(":")[0].strip().title()
-                specs[key] = line
-    except Exception as e:
-        print(Fore.RED + f"[✗] Spec extraction failed: {e}" + Style.RESET_ALL)
-    return specs
-
-# ============================================================
-# DESCRIPTION GENERATION
-# ============================================================
-def generate_description(text, specs):
-    """Generate human-readable description using OpenAI or Grok."""
-    if not text.strip() and not specs:
-        return "No text or specs extracted from the drawing."
-
-    prompt = f"""
-You are an expert AutoCAD drawing summarizer.
-Extracted text (first 3000 characters):
-{text[:3000]}
-Extracted specifications:
+Specifications:
 {json.dumps(specs, indent=2)}
-Write a concise, plain English summary (100-200 words) explaining what this AutoCAD drawing represents. 
-Include key details such as the type of drawing, main components, dimensions, scale, and any relevant metadata (e.g., project, revision, or title).
-If specific details are missing, note that and provide a general description only based on available information.
-"""
-    desc = chat_with_ai(prompt, temperature=0.4, max_tokens=300)
-    if desc:
-        print(Fore.GREEN + "[✓] Description generated successfully." + Style.RESET_ALL)
-        return desc
-    else:
-        print(Fore.YELLOW + "[!] No AI provider available for description generation." + Style.RESET_ALL)
-        return "Unable to generate description: No API available."
- 
-# ============================================================
-# QUESTION ANSWERING
-# ============================================================
-def answer_question(question, text, specs, description):
-    """Answer user questions about a specific drawing using OpenAI or Grok."""
-    if not text.strip() and not specs and not description:
-        return "No data available to answer questions about this drawing."
-    prompt = f"""
-You are an AutoCAD drawing analysis assistant.
-Drawing details:
-- Extracted text: {text[:3000]}
-- Specifications: {json.dumps(specs, indent=2)}
-- Description: {description}
-User question: {question}
-Provide a concise and accurate answer based on the available drawing details. If the information is insufficient, state so clearly.
-"""
 
-    if openai_client:
-        try:
-            print(Fore.BLUE + "[→] Answering question using OpenAI..." + Style.RESET_ALL)
-            completion = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are an AutoCAD drawing analysis assistant."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-                max_tokens=200
+Description:
+{description}
+
+Question:
+{question}
+
+If the answer is not present in the content, reply ONLY with "Unknown".
+Be specific and reference the document details."""
+
+    try:
+        if grok_client:
+            resp = grok_client.chat(
+                [{"role": "user", "content": prompt}], 
+                model=GROK_MODEL
             )
-            answer = completion.choices[0].message.content.strip()
-            print(Fore.GREEN + "[✓] Answer generated successfully." + Style.RESET_ALL)
-            return answer
-        except Exception as e:
-            print(Fore.RED + f"[✗] OpenAI question answering failed: {e}" + Style.RESET_ALL)
-    if grok_client:
-        try:
-            print(Fore.BLUE + "[→] Falling back to Grok for question answering..." + Style.RESET_ALL)
-            completion = grok_client.chat.completions.create(
-                model="grok-3-fast-beta",
+            return resp["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        if not silent:
+            print(Fore.RED + f"Grok failed: {e}" + Style.RESET_ALL)
+
+    try:
+        if openai_client:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=200
+                temperature=0,
+                max_tokens=400
             )
-            answer = completion.choices[0].message.content.strip()
-            print(Fore.GREEN + "[✓] Answer generated via Grok." + Style.RESET_ALL)
-            return answer
-        except Exception as e:
-            print(Fore.RED + f"[✗] Grok question answering failed: {e}" + Style.RESET_ALL)
-    
-    return "Unable to answer question: No API available."
+            return resp.choices[0].message.content.strip()
+    except Exception as e:
+        if not silent:
+            print(Fore.RED + f"OpenAI failed: {e}" + Style.RESET_ALL)
 
-# ============================================================
-# PROCESSING PIPELINE
-# ============================================================
-def process_pdf(file_path):
-    """
-    Extract text/specs from PDF and add to database if valid AutoCAD PDF.
-    Returns True if successfully added, False otherwise.
-    """
-    if not os.path.exists(file_path):
-        print(Fore.RED + f"File does not exist: {file_path}" + Style.RESET_ALL)
-        return False
-    if not is_autocad_pdf(file_path):
-        print(Fore.YELLOW + f"Skipped: Not a valid AutoCAD PDF -> {os.path.basename(file_path)}" + Style.RESET_ALL)
-        return False
-
-    from PDF_Analyzer import extract_text, ocr_full_document, extract_specs_from_text, generate_description
-    text = extract_text(file_path)
-    if not text.strip():
-        text = ocr_full_document(file_path)
-
-    specs = extract_specs_from_text(text)
-    if not is_valid_specs(specs):
-        print(Fore.YELLOW + f"Skipped: No valid specs found in {os.path.basename(file_path)}" + Style.RESET_ALL)
-        return False
-    desc = generate_description(text, specs) #generate description 
-
-    from semanticMemory import add_to_database
-    if add_to_database(file_path, desc, specs):
-        print(Fore.GREEN + f"Completed and saved: {os.path.basename(file_path)}" + Style.RESET_ALL)
-        return True
-    else:
-        print(Fore.RED + f"Failed to save to database: {os.path.basename(file_path)}" + Style.RESET_ALL)
-        return False
+    return "Unknown"
