@@ -1,0 +1,13 @@
+	Requirements
+================================
+openai==2.7.1    
+httpx==0.28.1  
+python-dotenv==1.2.1   
+pdfplumber==0.11.7   
+PyMuPDF==1.26.6  
+pdf2image  
+pytesseract  
+opencv-python 
+Pillow    
+chromadb   
+colorama  
