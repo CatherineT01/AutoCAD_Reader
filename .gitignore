@@ -1,29 +1,37 @@
-# GitPortable
-GitPortable/
+# ODA SDK binaries
+*.dll
+*.tx
+*.exe
+ODAFileConverter.exe
+Icon-ODA.ico
+qt.conf
+vc_redist.x64.exe
+imageformats/
+platforms/
 
-# Python cache / compiled files
+# Python environment
+python/
+venv/
+env/
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 
-# Logs / temporary files
-*.log
-*.tmp
-*.bak
-*.env
+# ChromaDB persistent storage
+chroma_db/
+chroma_persist/
 
-# Visual Studio files
+# Build outputs
+*.zip
+convertingInC/build/
+convertingInC/bin/
+convertingInC/obj/
+convertingInC/x64/
+
+# IDE files
+*.pyproj
 .vs/
-bin/
-obj/
-*.user
-*.suo
 
-# Databases / logs
-*.db
-*.json
-*.txt
-
-# Other temporary folders
-DWG_to_PDF/
+# Allow solution files (override ignore)
+!tester.sln
+!convertingInC/C_Converting.sln
